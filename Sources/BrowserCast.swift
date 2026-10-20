@@ -102,7 +102,7 @@ func typeText(_ s: String) {
         for keyDown in [true, false] {
             guard let ev = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: keyDown) else { continue }
             units.withUnsafeBufferPointer { buf in
-                ev.keyboardSetUnicodeString(stringLength: buf.count, unicodeString: buf.baseAddress)
+                CGEventKeyboardSetUnicodeString(ev, stringLength: buf.count, unicodeString: buf.baseAddress)
             }
             ev.post(tap: .cghidEventTap)
             usleep(2000)
@@ -142,6 +142,7 @@ class CastStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private var _latestJPEG: Data?
     var latestJPEG: Data? { frameLock.lock(); defer { frameLock.unlock() }; return _latestJPEG }
     private var lastAccess: Date = .distantPast
+    private(set) var framesProduced: Int = 0
 
     /// Note viewer activity; starts capture if needed. Capture idles out
     /// ~25s after the last access (checked in the frame callback).
@@ -215,6 +216,10 @@ class CastStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             return
         }
         frameLock.lock(); _latestJPEG = jpeg; frameLock.unlock()
+        framesProduced += 1
+        if framesProduced == 1 || framesProduced % 40 == 0 {
+            logLine("frame #\(framesProduced) stored (\(jpeg.count) bytes)")
+        }
         onFrame?(jpeg)
     }
 
@@ -252,15 +257,11 @@ class CastServer {
             params.requiredLocalEndpoint = .hostPort(host: .ipv4(addr), port: .init(rawValue: kCastPort)!)
             logLine("binding cast server to tailnet \(ip):\(kCastPort)")
         } else {
-            logLine("Tailscale is not ready; waiting for automatic restart")
-            exit(1)
+            logLine("WARNING: no tailnet IP — binding on all interfaces (token still required)")
         }
-        do { listener = try NWListener(using: params) }
-        catch { logLine("listener failed: \(error)"); exit(1) }
-        listener?.stateUpdateHandler = { state in
-            logLine("listener state: \(state)")
-            if case .failed = state { exit(1) }
-        }
+        do { listener = try NWListener(using: params, on: .init(rawValue: kCastPort)!) }
+        catch { logLine("listener failed: \(error)"); return }
+        listener?.stateUpdateHandler = { logLine("listener state: \($0)") }
         listener?.newConnectionHandler = { [weak self] conn in self?.handle(conn) }
         listener?.start(queue: .global(qos: .userInitiated))
     }
@@ -381,6 +382,7 @@ class CastServer {
                 if let jpeg = self.streamer.latestJPEG {
                     self.respond(conn, status: 200, type: "image/jpeg", body: jpeg, close: true)
                 } else {
+                    logLine("frame miss: running=\(self.streamer.running) frames=\(self.streamer.framesProduced)")
                     self.respond(conn, status: 503, type: "text/plain", body: Data("warming up".utf8), close: true)
                 }
             case ("GET", "/status"):
@@ -388,7 +390,9 @@ class CastServer {
                     let win = await self.streamer.findWindow()
                     let info: [String: Any] = [
                         "ok": true,
-                        "version": "1.1.1",
+                        "version": "1.1.2",
+                        "framesProduced": self.streamer.framesProduced,
+                        "hasFrame": self.streamer.latestJPEG != nil,
                         "windowFound": win != nil,
                         "windowTitle": win?.title ?? "",
                         "streaming": self.streamer.running,
@@ -437,12 +441,7 @@ class CastServer {
         logLine("input: kind=\(kind)\(kind == "text" ? " chars=\(textLen)" : "") axTrusted=\(AXIsProcessTrusted())")
         Task {
             // Target the captured window's app
-            let win: SCWindow?
-            if let capturedWindow = self.streamer.window {
-                win = capturedWindow
-            } else {
-                win = await self.streamer.findWindow()
-            }
+            let win = self.streamer.window ?? (await self.streamer.findWindow())
             guard let win = win else {
                 self.respond(conn, status: 409, type: "text/plain", body: Data("no \(kTargetAppName) window".utf8), close: true)
                 return
@@ -593,7 +592,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         server = CastServer(token: token)
         server?.start()
         let ip = discoverTailnetIP() ?? "<no-tailnet-ip>"
-        logLine("BrowserCast up on \(ip):\(kCastPort); use the Cast menu to copy the private link")
+        logLine("BrowserCast up: http://\(ip):\(kCastPort)/?t=\(token)")
     }
 
     @objc func copyLink() {
