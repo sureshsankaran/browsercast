@@ -65,6 +65,9 @@ cat > "$PLIST_PATH" <<PLIST
   <key>ProgramArguments</key>
   <array><string>$APP/Contents/MacOS/BrowserCast</string></array>
   <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>15</integer>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
   <key>StandardOutPath</key><string>$HOME/Library/Logs/BrowserCast.log</string>
   <key>StandardErrorPath</key><string>$HOME/Library/Logs/BrowserCast.log</string>
 </dict>
