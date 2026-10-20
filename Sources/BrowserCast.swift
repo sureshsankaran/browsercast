@@ -12,6 +12,10 @@
 //   * Access is gated by a random token in the link; the server binds to the
 //     Mac's Tailscale IP only. Never expose it beyond the tailnet.
 //
+// v1.1: text is typed via Unicode-string key events (layout/modifier-proof —
+// v1.0's raw keycode + synthetic Shift path mangled capitals and digits).
+// Server reads full request bodies (Content-Length), the page shows server
+// responses instead of failing silently, and /status reports permission state.
 // v1.0 scope: one stream client, click + double-click, text typing, a few
 // special keys. No scroll relay yet (login pages fit on one screen).
 
@@ -72,29 +76,13 @@ func discoverTailnetIP() -> String? {
     return nil
 }
 
-// MARK: - Typing (CGEvent, US layout)
-
-func keyMapping(_ ch: Character) -> (code: UInt16, shift: Bool)? {
-    let lower: [Character: UInt16] = [
-        "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8,
-        "v": 9, "b": 11, "q": 12, "w": 13, "e": 14, "r": 15, "y": 16, "t": 17,
-        "o": 31, "u": 32, "i": 34, "p": 35, "l": 37, "j": 38, "k": 40,
-        "n": 45, "m": 46,
-        "1": 18, "2": 19, "3": 20, "4": 21, "5": 23, "6": 22, "7": 26,
-        "8": 28, "9": 25, "0": 29,
-        "-": 27, "=": 24, "]": 30, "[": 33, "'": 39, ";": 41, "\\": 42,
-        ",": 43, ".": 47, "/": 44, "`": 50, " ": 49,
-    ]
-    let shiftedSymbols: [Character: Character] = [
-        "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7",
-        "*": "8", "(": "9", ")": "0", "_": "-", "+": "=", "}": "]", "{": "[",
-        "\"": "'", ":": ";", "|": "\\", "<": ",", ">": ".", "?": "/", "~": "`",
-    ]
-    if let code = lower[ch] { return (code, false) }
-    if ch.isUppercase, let code = lower[Character(ch.lowercased())] { return (code, true) }
-    if let base = shiftedSymbols[ch], let code = lower[base] { return (code, true) }
-    return nil
-}
+// MARK: - Typing
+//
+// Text is typed with Unicode-string key events: each event carries the exact
+// character, so the receiving app never has to translate keycode + modifier
+// state (the v1.0 raw-keycode path mangled capitals, digits, and symbols).
+// Special keys (Tab/Enter/Esc/…) still use their real keycodes — those are
+// layout-independent.
 
 func postKey(code: UInt16, shift: Bool) {
     let src = CGEventSource(stateID: .hidSystemState)
@@ -102,14 +90,24 @@ func postKey(code: UInt16, shift: Bool) {
     let up = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(code), keyDown: false)
     if shift { down?.flags = .maskShift; up?.flags = .maskShift }
     down?.post(tap: .cghidEventTap)
+    usleep(2000)
     up?.post(tap: .cghidEventTap)
 }
 
 func typeText(_ s: String) {
+    let src = CGEventSource(stateID: .hidSystemState)
     for ch in s {
-        guard let (code, shift) = keyMapping(ch) else { continue }
-        postKey(code: code, shift: shift)
-        usleep(9000)
+        let units = Array(String(ch).utf16)
+        guard !units.isEmpty else { continue }
+        for keyDown in [true, false] {
+            guard let ev = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: keyDown) else { continue }
+            units.withUnsafeBufferPointer { buf in
+                CGEventKeyboardSetUnicodeString(ev, stringLength: buf.count, unicodeString: buf.baseAddress)
+            }
+            ev.post(tap: .cghidEventTap)
+            usleep(2000)
+        }
+        usleep(12000)
     }
 }
 
@@ -277,8 +275,40 @@ class CastServer {
             if case .failed = state { self?.removeClient(conn) }
         }
         conn.start(queue: .global(qos: .userInitiated))
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, _, _ in
-            guard let self = self, let data = data, let raw = String(data: data, encoding: .utf8) else { conn.cancel(); return }
+        readRequest(conn, buffer: Data())
+    }
+
+    /// Accumulate until the request is complete (headers + full Content-Length
+    /// body) before dispatching — a single receive() can return only the
+    /// headers when a phone browser sends the body in a separate packet.
+    func readRequest(_ conn: NWConnection, buffer: Data) {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, _ in
+            guard let self = self else { conn.cancel(); return }
+            var buf = buffer
+            if let data = data { buf.append(data) }
+            guard let raw = String(data: buf, encoding: .utf8),
+                  let sepRange = raw.range(of: "\r\n\r\n") else {
+                if isComplete || buf.count > 65536 { conn.cancel(); return }
+                self.readRequest(conn, buffer: buf)
+                return
+            }
+            let headPart = String(raw[raw.startIndex..<sepRange.lowerBound])
+            var contentLength = 0
+            for line in headPart.components(separatedBy: "\r\n") where line.lowercased().hasPrefix("content-length:") {
+                contentLength = Int(line.dropFirst("content-length:".count).trimmingCharacters(in: .whitespaces)) ?? 0
+            }
+            let bodyAvailable = buf.count - (headPart.utf8.count + 4)
+            if bodyAvailable < contentLength {
+                if isComplete { conn.cancel(); return }
+                self.readRequest(conn, buffer: buf)
+                return
+            }
+            self.dispatch(conn, raw: raw)
+        }
+    }
+
+    func dispatch(_ conn: NWConnection, raw: String) {
+        do {
             let head = raw.components(separatedBy: "\r\n\r\n").first ?? ""
             let lines = head.components(separatedBy: "\r\n")
             let requestLine = lines.first ?? ""
@@ -322,10 +352,13 @@ class CastServer {
                     let win = await self.streamer.findWindow()
                     let info: [String: Any] = [
                         "ok": true,
+                        "version": "1.1",
                         "windowFound": win != nil,
                         "windowTitle": win?.title ?? "",
                         "streaming": self.streamer.running,
                         "clients": self.clients.count,
+                        "accessibilityTrusted": AXIsProcessTrusted(),
+                        "screenCaptureOk": CGPreflightScreenCaptureAccess(),
                     ]
                     let body = (try? JSONSerialization.data(withJSONObject: info)) ?? Data()
                     self.respond(conn, status: 200, type: "application/json", body: body, close: true)
@@ -357,9 +390,13 @@ class CastServer {
         guard let data = body.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let kind = obj["kind"] as? String else {
+            logLine("input rejected: unparseable body (\(body.count) bytes)")
             respond(conn, status: 400, type: "text/plain", body: Data("bad input".utf8), close: true)
             return
         }
+        // Log kind/length only — never the content (it may be a password).
+        let textLen = (obj["text"] as? String)?.count ?? 0
+        logLine("input: kind=\(kind)\(kind == "text" ? " chars=\(textLen)" : "") axTrusted=\(AXIsProcessTrusted())")
         Task {
             // Target the captured window's app
             let win = self.streamer.window ?? (await self.streamer.findWindow())
@@ -429,21 +466,43 @@ func castPageHTML(token: String) -> String {
       <button onclick="sendKey('backspace')">⌫</button>
       <button onclick="sendKey('esc')">Esc</button>
     </div>
+    <div id="status" class="hint">Ready.</div>
     <div class="hint">Tap the image to click there (e.g. tap the username field, then type above; tap the password field, then use the password box). Double-tap = double click. What you type is sent only to your Mac over your Tailscale network and typed into the window — it is never stored.</div>
     </div>
     <script>
       const T = "\(token)";
       const img = document.getElementById('view');
+      const statusEl = document.getElementById('status');
       let lastTap = 0;
-      function post(body){ fetch('/input?t='+T, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}); }
+      function setStatus(s){ statusEl.textContent = s; }
+      async function post(body){
+        setStatus('Sending…');
+        try {
+          const r = await fetch('/input?t='+T, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+          const t = await r.text();
+          setStatus(r.ok ? ('✓ Mac: ' + t) : ('✗ Mac error ' + r.status + ': ' + t));
+          return r.ok;
+        } catch(err) {
+          setStatus('✗ Could not reach the Mac: ' + err);
+          return false;
+        }
+      }
       img.addEventListener('click', e => {
         const r = img.getBoundingClientRect();
         const nx = (e.clientX - r.left)/r.width, ny = (e.clientY - r.top)/r.height;
         const now = Date.now(); const dbl = (now - lastTap) < 350; lastTap = now;
         post({kind:'click', nx:nx, ny:ny, double:dbl});
       });
-      function sendText(id){ const el = document.getElementById(id); if(el.value){ post({kind:'text', text: el.value}); el.value=''; } el.focus(); }
+      async function sendText(id){
+        const el = document.getElementById(id);
+        if(!el.value){ setStatus('Nothing to send — the box is empty.'); return; }
+        const ok = await post({kind:'text', text: el.value});
+        if(ok){ el.value=''; }
+        el.focus();
+      }
       function sendKey(k){ post({kind:'key', key:k}); }
+      document.getElementById('txt').addEventListener('keydown', e => { if(e.key === 'Enter'){ e.preventDefault(); sendText('txt'); } });
+      document.getElementById('pwd').addEventListener('keydown', e => { if(e.key === 'Enter'){ e.preventDefault(); sendText('pwd'); } });
     </script></body></html>
     """
 }

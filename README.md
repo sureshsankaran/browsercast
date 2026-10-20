@@ -68,7 +68,18 @@ credential ever passes through the agent, the chat, or any storage.
   (close/reopen the page) after resizing it.
 - No scroll relay yet — pages must fit the window (login pages do).
 - ~8 fps JPEG stream: fine for forms, not for video.
-- US keyboard layout for relayed typing.
+- Relayed typing is layout-independent (Unicode key events) as of v1.1.
+
+## Changelog
+
+- **v1.1** — typing fixed: text is sent as Unicode-string key events (v1.0's
+  raw keycode + synthetic Shift path mangled capitals, digits, and symbols).
+  Server now reads complete request bodies before parsing; the cast page
+  shows the Mac's response (✓/✗) instead of failing silently and Enter in a
+  text box now sends; `/status` reports `version`, `accessibilityTrusted`,
+  and `screenCaptureOk` for remote diagnosis. Note: after ANY reinstall,
+  macOS may require removing and re-adding BrowserCast under Accessibility /
+  Screen Recording (ad-hoc signing changes the app identity per build).
 
 ## Removing
 
