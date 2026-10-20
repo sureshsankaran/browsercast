@@ -18,6 +18,11 @@ if ! xcode-select -p >/dev/null 2>&1; then
   exit 1
 fi
 
+echo "Stopping any running BrowserCast…"
+launchctl unload "$HOME/Library/LaunchAgents/com.muse.browsercast.plist" >/dev/null 2>&1 || true
+pkill -x BrowserCast >/dev/null 2>&1 || true
+sleep 1
+
 APP="$HOME/Applications/BrowserCast.app"
 BUILD="$(mktemp -d)"
 echo "Building…"
