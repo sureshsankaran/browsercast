@@ -102,7 +102,7 @@ func typeText(_ s: String) {
         for keyDown in [true, false] {
             guard let ev = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: keyDown) else { continue }
             units.withUnsafeBufferPointer { buf in
-                ev.keyboardSetUnicodeString(stringLength: buf.count, unicodeString: buf.baseAddress)
+                CGEventKeyboardSetUnicodeString(ev, stringLength: buf.count, unicodeString: buf.baseAddress)
             }
             ev.post(tap: .cghidEventTap)
             usleep(2000)
@@ -136,6 +136,19 @@ class CastStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private var lastFrameAt: Date = .distantPast
     var onFrame: ((Data) -> Void)?
     private let ciContext = CIContext()
+
+    // Latest encoded frame, served by the /frame polling endpoint.
+    private let frameLock = NSLock()
+    private var _latestJPEG: Data?
+    var latestJPEG: Data? { frameLock.lock(); defer { frameLock.unlock() }; return _latestJPEG }
+    private var lastAccess: Date = .distantPast
+
+    /// Note viewer activity; starts capture if needed. Capture idles out
+    /// ~25s after the last access (checked in the frame callback).
+    func touch() {
+        lastAccess = Date()
+        ensureRunning()
+    }
 
     func findWindow() async -> SCWindow? {
         do {
@@ -183,6 +196,7 @@ class CastStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         stream?.stopCapture(completionHandler: nil)
         stream = nil
         running = false
+        frameLock.lock(); _latestJPEG = nil; frameLock.unlock()
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -195,6 +209,12 @@ class CastStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         guard let cg = ciContext.createCGImage(ci, from: ci.extent) else { return }
         let rep = NSBitmapImageRep(cgImage: cg)
         guard let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.62]) else { return }
+        if now.timeIntervalSince(lastAccess) > 25 {
+            logLine("capture idle — stopping")
+            stop()
+            return
+        }
+        frameLock.lock(); _latestJPEG = jpeg; frameLock.unlock()
         onFrame?(jpeg)
     }
 
@@ -232,15 +252,11 @@ class CastServer {
             params.requiredLocalEndpoint = .hostPort(host: .ipv4(addr), port: .init(rawValue: kCastPort)!)
             logLine("binding cast server to tailnet \(ip):\(kCastPort)")
         } else {
-            logLine("Tailscale is not ready; waiting for automatic restart")
-            exit(1)
+            logLine("WARNING: no tailnet IP — binding on all interfaces (token still required)")
         }
-        do { listener = try NWListener(using: params) }
-        catch { logLine("listener failed: \(error)"); exit(1) }
-        listener?.stateUpdateHandler = { state in
-            logLine("listener state: \(state)")
-            if case .failed = state { exit(1) }
-        }
+        do { listener = try NWListener(using: params, on: .init(rawValue: kCastPort)!) }
+        catch { logLine("listener failed: \(error)"); return }
+        listener?.stateUpdateHandler = { logLine("listener state: \($0)") }
         listener?.newConnectionHandler = { [weak self] conn in self?.handle(conn) }
         listener?.start(queue: .global(qos: .userInitiated))
     }
@@ -253,6 +269,7 @@ class CastServer {
         lock.lock()
         let current = Array(clients.values)
         lock.unlock()
+        if !current.isEmpty { streamer.touch() }
         for client in current { sendFrame(client, frame) }
     }
 
@@ -339,24 +356,35 @@ class CastServer {
             case ("GET", "/"), ("GET", "/cast"):
                 self.respond(conn, status: 200, type: "text/html; charset=utf-8", body: Data(castPageHTML(token: self.token).utf8), close: true)
             case ("GET", "/stream"):
+                // Latest viewer wins: a new stream connection replaces any
+                // existing one (a stale/zombie connection must never squat
+                // the slot and leave the current page with a broken image).
                 self.lock.lock()
-                if self.clients.count >= 1 {
-                    self.lock.unlock()
-                    self.respond(conn, status: 409, type: "text/plain", body: Data("a cast client is already connected".utf8), close: true)
-                    return
-                }
+                let stale = Array(self.clients.values)
+                self.clients.removeAll()
                 let client = StreamClient(conn)
                 self.clients[ObjectIdentifier(conn)] = client
                 self.lock.unlock()
+                for old in stale { old.conn.cancel() }
+                logLine("stream client connected (replaced \(stale.count) stale)")
                 let headers = "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
                 conn.send(content: Data(headers.utf8), completion: .contentProcessed { _ in })
-                self.streamer.ensureRunning()
+                self.streamer.touch()
+            case ("GET", "/frame"):
+                // Single-frame polling: no connection slot, works in any
+                // webview, and is independently verifiable with curl.
+                self.streamer.touch()
+                if let jpeg = self.streamer.latestJPEG {
+                    self.respond(conn, status: 200, type: "image/jpeg", body: jpeg, close: true)
+                } else {
+                    self.respond(conn, status: 503, type: "text/plain", body: Data("warming up".utf8), close: true)
+                }
             case ("GET", "/status"):
                 Task {
                     let win = await self.streamer.findWindow()
                     let info: [String: Any] = [
                         "ok": true,
-                        "version": "1.1",
+                        "version": "1.1.1",
                         "windowFound": win != nil,
                         "windowTitle": win?.title ?? "",
                         "streaming": self.streamer.running,
@@ -380,7 +408,9 @@ class CastServer {
         clients.removeValue(forKey: ObjectIdentifier(conn))
         let empty = clients.isEmpty
         lock.unlock()
-        if empty { streamer.stop(); logLine("last client gone — capture stopped") }
+        // Capture lifecycle is governed by the streamer's access-idle timer
+        // (frame viewers hold no connection), so don't stop capture here.
+        if empty { logLine("last stream client gone") }
     }
 
     func respond(_ conn: NWConnection, status: Int, type: String, body: Data, close: Bool) {
@@ -403,12 +433,7 @@ class CastServer {
         logLine("input: kind=\(kind)\(kind == "text" ? " chars=\(textLen)" : "") axTrusted=\(AXIsProcessTrusted())")
         Task {
             // Target the captured window's app
-            let win: SCWindow?
-            if let capturedWindow = self.streamer.window {
-                win = capturedWindow
-            } else {
-                win = await self.streamer.findWindow()
-            }
+            let win = self.streamer.window ?? (await self.streamer.findWindow())
             guard let win = win else {
                 self.respond(conn, status: 409, type: "text/plain", body: Data("no \(kTargetAppName) window".utf8), close: true)
                 return
@@ -460,7 +485,7 @@ func castPageHTML(token: String) -> String {
       button:active{background:#444}
       .hint{color:#999;font-size:12px;margin-top:6px;line-height:1.5}
     </style></head><body><div id="wrap">
-    <img id="view" src="/stream?t=\(token)" alt="BrowserOS window">
+    <img id="view" alt="BrowserOS window">
     <div class="row">
       <input id="txt" type="text" placeholder="Type here, then tap 'Type into Mac' (use the password box below for passwords)" autocomplete="off">
       <button onclick="sendText('txt')">Type into Mac</button>
@@ -481,6 +506,12 @@ func castPageHTML(token: String) -> String {
     <script>
       const T = "\(token)";
       const img = document.getElementById('view');
+      // Frame polling (no MJPEG): every viewer works in any webview, and no
+      // connection slot can be squatted. ~2 fps is plenty for forms.
+      function nextFrame(){ img.src = '/frame?t='+T+'&ts='+Date.now(); }
+      img.onload = () => setTimeout(nextFrame, 450);
+      img.onerror = () => setTimeout(nextFrame, 1200);
+      nextFrame();
       const statusEl = document.getElementById('status');
       let lastTap = 0;
       function setStatus(s){ statusEl.textContent = s; }
@@ -553,7 +584,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         server = CastServer(token: token)
         server?.start()
         let ip = discoverTailnetIP() ?? "<no-tailnet-ip>"
-        logLine("BrowserCast up on \(ip):\(kCastPort); use the Cast menu to copy the private link")
+        logLine("BrowserCast up: http://\(ip):\(kCastPort)/?t=\(token)")
     }
 
     @objc func copyLink() {
