@@ -102,7 +102,7 @@ func typeText(_ s: String) {
         for keyDown in [true, false] {
             guard let ev = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: keyDown) else { continue }
             units.withUnsafeBufferPointer { buf in
-                CGEventKeyboardSetUnicodeString(ev, stringLength: buf.count, unicodeString: buf.baseAddress)
+                ev.keyboardSetUnicodeString(stringLength: buf.count, unicodeString: buf.baseAddress)
             }
             ev.post(tap: .cghidEventTap)
             usleep(2000)
@@ -252,11 +252,15 @@ class CastServer {
             params.requiredLocalEndpoint = .hostPort(host: .ipv4(addr), port: .init(rawValue: kCastPort)!)
             logLine("binding cast server to tailnet \(ip):\(kCastPort)")
         } else {
-            logLine("WARNING: no tailnet IP — binding on all interfaces (token still required)")
+            logLine("Tailscale is not ready; waiting for automatic restart")
+            exit(1)
         }
-        do { listener = try NWListener(using: params, on: .init(rawValue: kCastPort)!) }
-        catch { logLine("listener failed: \(error)"); return }
-        listener?.stateUpdateHandler = { logLine("listener state: \($0)") }
+        do { listener = try NWListener(using: params) }
+        catch { logLine("listener failed: \(error)"); exit(1) }
+        listener?.stateUpdateHandler = { state in
+            logLine("listener state: \(state)")
+            if case .failed = state { exit(1) }
+        }
         listener?.newConnectionHandler = { [weak self] conn in self?.handle(conn) }
         listener?.start(queue: .global(qos: .userInitiated))
     }
@@ -433,7 +437,12 @@ class CastServer {
         logLine("input: kind=\(kind)\(kind == "text" ? " chars=\(textLen)" : "") axTrusted=\(AXIsProcessTrusted())")
         Task {
             // Target the captured window's app
-            let win = self.streamer.window ?? (await self.streamer.findWindow())
+            let win: SCWindow?
+            if let capturedWindow = self.streamer.window {
+                win = capturedWindow
+            } else {
+                win = await self.streamer.findWindow()
+            }
             guard let win = win else {
                 self.respond(conn, status: 409, type: "text/plain", body: Data("no \(kTargetAppName) window".utf8), close: true)
                 return
@@ -584,7 +593,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         server = CastServer(token: token)
         server?.start()
         let ip = discoverTailnetIP() ?? "<no-tailnet-ip>"
-        logLine("BrowserCast up: http://\(ip):\(kCastPort)/?t=\(token)")
+        logLine("BrowserCast up on \(ip):\(kCastPort); use the Cast menu to copy the private link")
     }
 
     @objc func copyLink() {
